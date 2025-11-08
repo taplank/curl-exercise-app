@@ -25,6 +25,7 @@ python cv_proj.py \
     --epochs 10 \
     --batch 4 \
     --batches_per_epoch 100
+    
 Then run the RCNN in demo mode so you can see it:
 python cv_proj.py --run_demo --resume_ckpt ./ckpt/model_final.pth --input_size 512
 
