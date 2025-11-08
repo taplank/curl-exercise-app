@@ -12,5 +12,5 @@ Use m to move to the next exercise, and n to go back to the previous one. \
 The pose of the person doing the workout will follow you, so change your camera angle so it lines up nicely. \
 You will get a "Yay!" if you are close enough, else "Keep going." \
 Name of exercise is in top left. \ 
-I will try to add more updates to the exercise app to make the UI cleaner, and ideally get the R-CNN fully working first. Though I'm happy of the work I put into it regardless. \
+I will try to add more updates to the exercise app to make the UI cleaner, and ideally get the R-CNN fully working first. Though I'm happy of the work I put into it regardless. 
 
