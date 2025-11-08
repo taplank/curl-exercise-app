@@ -1,0 +1,436 @@
+import os
+import sys
+import argparse
+import logging
+from pathlib import Path
+
+import cv2
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torchvision.models import resnet18, ResNet18_Weights
+from torchvision.ops import roi_align
+from pycocotools.coco import COCO
+from tqdm import tqdm
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
+
+# -------------------------
+# apparently necessary 
+# -------------------------
+parser = argparse.ArgumentParser()
+parser.add_argument("--ann", help="COCO keypoint annotations JSON")
+parser.add_argument("--images", help="COCO images directory")
+parser.add_argument("--epochs", type=int, default=10)
+parser.add_argument("--batch", type=int, default=4)
+parser.add_argument("--lr", type=float, default=1e-4)
+parser.add_argument("--input_size", type=int, default=512)
+parser.add_argument("--out", type=str, default="./ckpt")
+parser.add_argument("--batches_per_epoch", type=int, default=1000)
+parser.add_argument("--run_demo", action="store_true")
+parser.add_argument("--resume_ckpt", type=str)
+args = parser.parse_args()
+
+# -------------------------
+# line drawer
+# -------------------------
+coco_skeleton = [
+    (15, 13), (13, 11), (16, 14), (14, 12), (11, 12),
+    (5, 11), (6, 12), (5, 6), (5, 7), (6, 8), 
+    (7, 9), (8, 10), (1, 2), (0, 1), (0, 2), (1, 3), (2, 4)
+]
+
+# -------------------------
+# import dataset (claude)
+# -------------------------
+class CocoKeypointDataset(Dataset):
+    def __init__(self, ann_file: str, images_dir: str, input_size: int = 512):
+        logger.info(f"Loading COCO from {ann_file}")
+        self.coco = COCO(str(ann_file))
+        self.images_dir = Path(images_dir)
+        self.ids = sorted(self.coco.getImgIds())
+        self.input_size = input_size
+        self.failed_images = set() # Stores paths of failed images
+        logger.info(f"Dataset: {len(self.ids)} images")
+
+    def __len__(self):
+        return len(self.ids)
+
+    def __getitem__(self, idx):
+        # We use a large number of attempts, cycling through the dataset once
+        max_attempts = len(self.ids) 
+        current_idx = idx
+        
+        for attempt in range(max_attempts):
+            
+            try:
+                # 1. Get image info and path
+                img_info = self.coco.loadImgs(self.ids[current_idx])[0]
+                path = self.images_dir / img_info['file_name']
+                path_str = str(path)
+                
+                # Check if we've seen this fail before
+                if path_str in self.failed_images:
+                    # Move to the next index and continue to the next attempt
+                    current_idx = (current_idx + 1) % len(self.ids)
+                    continue
+                
+                # 2. Load image
+                img = cv2.imread(path_str)
+                
+                if img is None:
+                    # Image file could not be read (root cause of user error)
+                    logger.warning(f"Failed to load {path_str}. Check path/integrity.")
+                    self.failed_images.add(path_str)
+                    current_idx = (current_idx + 1) % len(self.ids)
+                    continue
+                
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                H, W = img.shape[:2]
+                
+                # Resize keeping aspect ratio
+                scale = self.input_size / max(H, W)
+                new_h, new_w = int(H * scale), int(W * scale)
+                img = cv2.resize(img, (new_w, new_h))
+                
+                # 3. Get annotations and resize keypoints/boxes
+                ann_ids = self.coco.getAnnIds(imgIds=img_info['id'], iscrowd=False)
+                anns = self.coco.loadAnns(ann_ids)
+                
+                boxes, kps = [], []
+                for ann in anns:
+                    if 'keypoints' not in ann or ann.get('num_keypoints', 0) == 0:
+                        continue
+                    x, y, w, h = ann['bbox']
+                    x1, y1 = x * scale, y * scale
+                    x2, y2 = (x + w) * scale, (y + h) * scale
+                    if x2 - x1 < 10 or y2 - y1 < 10:
+                        continue
+                    boxes.append([x1, y1, x2, y2])
+                    
+                    k = np.array(ann['keypoints'], dtype=np.float32).reshape(-1, 3)
+                    k[:, :2] *= scale
+                    kps.append(k[:17])
+                    
+                if len(boxes) == 0:
+                    # Skip images with no valid annotations
+                    current_idx = (current_idx + 1) % len(self.ids)
+                    continue
+                
+                boxes = np.array(boxes, dtype=np.float32)
+                kps = np.array(kps, dtype=np.float32)
+                
+                # 4. Prepare tensors and return
+                img_t = torch.from_numpy(img.astype(np.float32) / 255.0).permute(2, 0, 1)
+                return img_t, boxes, kps
+                
+            except Exception as e:
+                # Catch unexpected errors during processing
+                logger.error(f"Error processing index {current_idx} ({path_str}): {e}")
+                self.failed_images.add(path_str)
+                current_idx = (current_idx + 1) % len(self.ids)
+                
+            # If all images have been added to failed_images, break to return dummy data
+            if len(self.failed_images) == len(self.ids):
+                break
+        
+        # If the loop finishes without returning valid data, return dummy data
+        logger.error(f"Failed to load any valid image starting from index {idx}.")
+        dummy_img = torch.zeros((3, self.input_size, self.input_size))
+        dummy_boxes = np.zeros((0, 4), dtype=np.float32)
+        dummy_kps = np.zeros((0, 17, 3), dtype=np.float32)
+        return dummy_img, dummy_boxes, dummy_kps
+
+def collate_fn(batch):
+    imgs, boxes_list, kps_list = zip(*batch)
+    max_h = max(im.shape[1] for im in imgs)
+    max_w = max(im.shape[2] for im in imgs)
+    padded = [F.pad(im, (0, max_w - im.shape[2], 0, max_h - im.shape[1])) for im in imgs]
+    return torch.stack(padded), list(boxes_list), list(kps_list)
+
+# -------------------------
+# generate the "label" for the CNN to hit. 
+# -------------------------
+def make_heatmap_targets(rois, gt_kps, out_size=56, sigma=2.0):
+    # some np stuff i had to understand 
+    N, K = rois.shape[0], gt_kps.shape[1]
+    targets = np.zeros((N, K, out_size, out_size), dtype=np.float32)
+    
+    for i in range(N):
+        x1, y1, x2, y2 = rois[i]
+        w, h = max(x2 - x1, 1), max(y2 - y1, 1)
+        
+        for k in range(K):
+            xk, yk, v = gt_kps[i, k]
+            if v <= 0:
+                continue
+            
+            # take gaussian to smooth it out 
+            nx, ny = (xk - x1) / w, (yk - y1) / h
+            px, py = nx * (out_size - 1), ny * (out_size - 1)
+            
+            if 0 <= px < out_size and 0 <= py < out_size:
+                y_grid, x_grid = np.ogrid[:out_size, :out_size]
+                # actual gaussian distribution
+                gaussian = np.exp(-((x_grid - px)**2 + (y_grid - py)**2) / (2 * sigma**2))
+                targets[i, k] = np.maximum(targets[i, k], gaussian)
+    
+    return targets
+
+# -------------------------
+# CNN
+# -------------------------
+class KeypointRCNN(nn.Module):
+    def __init__(self, num_kp=17, pretrained=True):
+        super().__init__()
+        resnet = resnet18(weights=ResNet18_Weights.DEFAULT if pretrained else None)
+        self.backbone = nn.Sequential(*list(resnet.children())[:-2])
+        self.out_channels = 512
+        self.stride = 32
+        
+        self.kp_head = nn.Sequential(
+            nn.ConvTranspose2d(512, 256, 4, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(256, 256, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(256, 128, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(128, num_kp, 1)
+        )
+        self.heatmap_size = 56
+        
+    def forward(self, images, proposals):
+        feat = self.backbone(images)
+        if proposals.shape[0] == 0:
+            return torch.zeros((0, 17, self.heatmap_size, self.heatmap_size), device=images.device)
+        
+        # ROI Align to extract features from proposals
+        pooled = roi_align(feat, proposals, output_size=(7, 7), spatial_scale=1.0/self.stride, sampling_ratio=2)
+        heatmaps = self.kp_head(pooled)
+        return F.interpolate(heatmaps, size=(self.heatmap_size, self.heatmap_size), mode='bilinear', align_corners=False)
+
+# -------------------------
+# Training
+# -------------------------
+def train(model, dataloader, optimizer, device, batches_per_epoch):
+    model.train()
+    total_loss = 0.0
+    pbar = tqdm(dataloader, total=min(len(dataloader), batches_per_epoch))
+    
+    for batch_idx, (imgs, boxes_list, kps_list) in enumerate(pbar):
+        if batch_idx >= batches_per_epoch:
+            break
+        
+        imgs = imgs.to(device)
+        
+        # Build proposals
+        proposals = []
+        gt_kps_list = []
+        for b_idx, (boxes, kps) in enumerate(zip(boxes_list, kps_list)):
+            if boxes.shape[0] > 0:
+                for box in boxes:
+                    proposals.append([b_idx, box[0], box[1], box[2], box[3]])
+                gt_kps_list.append(kps)
+        
+        if len(proposals) == 0:
+            continue
+        
+        proposals = torch.tensor(proposals, dtype=torch.float32, device=device)
+        gt_kps = np.vstack(gt_kps_list)
+        
+        # generate targets for the algorithm
+        rois = proposals[:, 1:].cpu().numpy()
+        targets = make_heatmap_targets(rois, gt_kps, out_size=model.heatmap_size, sigma=2.0)
+        targets = torch.from_numpy(targets).to(device)
+        
+        # zero grads
+        optimizer.zero_grad()
+        preds = model(imgs, proposals)
+        
+        # prevent errors if there's any outliers in dataset (possibly not required for this one)
+        if preds.shape != targets.shape:
+             logger.warning(f"Shape mismatch: preds {preds.shape} vs targets {targets.shape}. Skipping batch.")
+             continue
+        
+        # loss 
+        loss = F.mse_loss(preds, targets)
+        
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        
+        total_loss += loss.item()
+        pbar.set_postfix({'loss': total_loss / (batch_idx + 1)})
+    
+    return total_loss / max(1, min(len(dataloader), batches_per_epoch))
+
+# -------------------------
+# draw "skeleton" -- this is what coco calls it 
+# -------------------------
+def draw_skeleton(img, kps, threshold=0.3):
+    vis = img.copy()
+    H, W = img.shape[:2]
+    
+    #diag Check threshold for drawing lines
+    # print(f"#diag: Draw Skeleton Threshold: {threshold}") 
+    
+    # Line Drawing Logic
+    for a, b in coco_skeleton:
+        if a >= len(kps) or b >= len(kps):
+            continue
+        xa, ya, sa = kps[a]
+        xb, yb, sb = kps[b]
+        
+        if sa >= threshold and sb >= threshold:
+            pt1 = (int(np.clip(xa, 0, W-1)), int(np.clip(ya, 0, H-1)))
+            pt2 = (int(np.clip(xb, 0, W-1)), int(np.clip(yb, 0, H-1)))
+            cv2.line(vis, pt1, pt2, (0, 255, 0), 2, cv2.LINE_AA)
+        #diag: Check line skip reason
+        # else:
+        #     print(f"#diag: Skipped line ({a}-{b}). Scores: {sa:.4f}, {sb:.4f}")
+
+    # Dot Drawing Logic
+    for i, (x, y, s) in enumerate(kps):
+        if s >= threshold:
+            #diag: Successfully passed threshold
+            # print(f"#diag: Keypoint {i} passed threshold (Score: {s:.4f}, Coords: ({x:.1f}, {y:.1f}))")
+            pt = (int(np.clip(x, 0, W-1)), int(np.clip(y, 0, H-1)))
+            cv2.circle(vis, pt, 4, (0, 255, 0), -1)
+            cv2.circle(vis, pt, 5, (255, 255, 255), 1)
+        #diag: Check dot skip reason
+        # else:
+        #     print(f"#diag: Keypoint {i} skipped (Score: {s:.4f})")
+    
+    return vis
+
+#gemini's doing something here which i no longer understand. 
+def predict_frame(model, frame_rgb, input_size=512, device='cpu', threshold=0.3):
+    H, W = frame_rgb.shape[:2]
+    scale = input_size / max(H, W)
+    new_h, new_w = int(H * scale), int(W * scale)
+    img = cv2.resize(frame_rgb, (new_w, new_h))
+    
+    # Pad the resized image to a square (input_size x input_size)
+    padded_img = np.zeros((input_size, input_size, 3), dtype=np.float32)
+    padded_img[:new_h, :new_w] = img
+    
+    img_t = torch.from_numpy(padded_img / 255.0).permute(2, 0, 1).unsqueeze(0).to(device)
+    
+    # Treat the valid, resized portion of the frame as the single proposal
+    proposals = torch.tensor([[0, 0, 0, new_w - 1, new_h - 1]], dtype=torch.float32, device=device)
+    
+    with torch.no_grad():
+        heatmaps = model(img_t, proposals).squeeze(0).cpu().numpy()
+    
+    kps = []
+    heatmap_res = heatmaps.shape[2] # 56
+    
+    # Keypoint decoding (Max value method)
+    for k in range(17):
+        hm = heatmaps[k]
+        idx = hm.argmax()
+        y_idx, x_idx = idx // heatmap_res, idx % heatmap_res
+        
+        score = hm[y_idx, x_idx]
+        
+        # Rescale from normalized proposal (0 to 1) to PIXEL coordinates of the *resized* image (new_w x new_h)
+        x_img = (x_idx / (heatmap_res - 1)) * (new_w - 1)
+        y_img = (y_idx / (heatmap_res - 1)) * (new_h - 1)
+        
+        # Rescale back to *original* image coordinates (H x W)
+        x_orig = x_img / scale
+        y_orig = y_img / scale
+        kps.append((x_orig, y_orig, score))
+
+        #diag: Print raw prediction result
+        # print(f"#diag: KP {k}: Max Score: {score:.4f}, Heatmap Index: ({x_idx}, {y_idx}), Orig Coords: ({x_orig:.1f}, {y_orig:.1f})")
+    
+    vis = draw_skeleton(frame_rgb, kps, threshold)
+    return cv2.cvtColor(vis, cv2.COLOR_BGR2RGB), kps # NOTE: Changed return from BGR to RGB here
+
+#finally something normal. webcam
+def run_webcam_demo(model, input_size=512, device='cpu'):
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("webcam does not work.")
+        return
+    
+    print("Press 'q' to quit.")
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        # Using a very low threshold to capture all predicted points for diagnosis
+        vis, _ = predict_frame(model, frame_rgb, input_size, device, threshold=0.03) 
+        
+        # We need to ensure the image is BGR for OpenCV display
+        cv2.imshow("Keypoint Demo", cv2.cvtColor(vis, cv2.COLOR_RGB2BGR)) 
+        
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+    
+    cap.release()
+    cv2.destroyAllWindows()
+
+# -------------------------
+# main
+# -------------------------
+if __name__ == "__main__":
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
+    # demo mode
+    if args.run_demo:
+        if not args.resume_ckpt:
+            print("Provide --resume_ckpt for demo mode")
+            sys.exit(1)
+        
+        model = KeypointRCNN(pretrained=False).to(device)
+        ckpt = torch.load(args.resume_ckpt, map_location=device)
+        model.load_state_dict(ckpt['model'])
+        model.eval()
+        run_webcam_demo(model, args.input_size, device)
+        sys.exit(0)
+    
+    # training mode
+    if not args.ann or not args.images:
+        print("Provide --ann and --images for training")
+        # yay for ui
+        sys.exit(1)
+    
+    os.makedirs(args.out, exist_ok=True)
+    
+    print(f"Creating dataset...")
+    dataset = CocoKeypointDataset(args.ann, args.images, args.input_size)
+    dataloader = DataLoader(dataset, batch_size=args.batch, shuffle=True, 
+                           collate_fn=collate_fn, num_workers=0)
+    
+    print(f"Initializing model...")
+    model = KeypointRCNN(pretrained=True).to(device)
+    # if you need to change lr do it here
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.epochs)
+    
+    logger.info(f"Training on {device} for {args.epochs} epochs")
+    
+    for epoch in range(args.epochs):
+        print(f"\n{'='*60}")
+        print(f"Epoch {epoch+1}/{args.epochs}")
+        print(f"{'='*60}")
+        loss = train(model, dataloader, optimizer, device, args.batches_per_epoch)
+        scheduler.step()
+        logger.info(f"Epoch {epoch+1}/{args.epochs} - Loss: {loss:.4f}")
+        
+        ckpt_path = os.path.join(args.out, f"epoch_{epoch+1}.pth")
+        torch.save({'model': model.state_dict(), 'epoch': epoch+1}, ckpt_path)
+        print(f"Saved: {ckpt_path}")
+    
+    final_path = os.path.join(args.out, "model_final.pth")
+    torch.save({'model': model.state_dict(), 'epoch': args.epochs}, final_path)
+    logger.info(f"Saved final model to {final_path}")
+    print(f"\nTraining complete! Final model: {final_path}")
