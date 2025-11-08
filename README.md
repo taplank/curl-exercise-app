@@ -14,11 +14,11 @@ You will get a "Yay!" if you are close enough, else "Keep going." \
 Name of exercise is in top left. \ 
 I will try to add more updates to the exercise app to make the UI cleaner, and ideally get the R-CNN fully working first. Though I'm happy of the work I put into it regardless. 
 
-For cv_proj, you will need to install val2017 from the coco datasets using wget:
+For cv_proj, you will need to install val2017 from the coco datasets using wget: \
 wget -c http://images.cocodataset.org/zips/val2017.zip
-unzip val2017.zip
+unzip val2017.zip 
 
-start the RCNN like this:
+start the RCNN like this: \
 python cv_proj.py \                                                               
     --ann ~/datasets/coco/annotations/person_keypoints_val2017.json \
     --images ~/datasets/coco/val2017 \
