@@ -5,6 +5,7 @@ To run this, you need to get your own Kaggle API from kaggle.com. It'll give you
 Download archive.zip from https://www.kaggle.com/datasets/philosopher0808/gym-workoutexercises-video. Yes, its a lot -- 10 GB. I'll make another file that removes selected files from the dataset in a bit. \
 Then unzip it to get the archive folder, and put app.py, kaggle.json, and workout_index.json in that same folder, then run app.py. 
 
+The app is interactive with buttons. \
 Use p to delete an exercise from the dataset, and l to skip to the next pose video of the current exercise. \
 p is very useful here for cleaning up bad data and only having the exercises you want. Feel free to be liberal -- you can always redownload the file. \
 Use m to move to the next exercise, and n to go back to the previous one. \
