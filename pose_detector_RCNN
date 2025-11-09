@@ -3,7 +3,6 @@ import sys
 import argparse
 import logging
 from pathlib import Path
-
 import cv2
 import numpy as np
 import torch
@@ -154,7 +153,7 @@ def collate_fn(batch):
 # -------------------------
 # generate the "label" for the CNN to hit. 
 # -------------------------
-def make_heatmap_targets(rois, gt_kps, out_size=56, sigma=2.0):
+def make_heatmap_targets(rois, gt_kps, out_size=64, sigma=2.0):
     # some np stuff i had to understand 
     N, K = rois.shape[0], gt_kps.shape[1]
     targets = np.zeros((N, K, out_size, out_size), dtype=np.float32)
@@ -168,14 +167,13 @@ def make_heatmap_targets(rois, gt_kps, out_size=56, sigma=2.0):
             if v <= 0:
                 continue
             
-            # take gaussian to smooth it out 
             nx, ny = (xk - x1) / w, (yk - y1) / h
             px, py = nx * (out_size - 1), ny * (out_size - 1)
             
             if 0 <= px < out_size and 0 <= py < out_size:
                 y_grid, x_grid = np.ogrid[:out_size, :out_size]
-                # actual gaussian distribution
-                gaussian = np.exp(-((x_grid - px)**2 + (y_grid - py)**2) / (2 * sigma**2))
+                # take gaussian distribution
+                gaussian = np.exp(-((x_grid - px)**2 + (y_grid - py)**2)/(2 * sigma**2))
                 targets[i, k] = np.maximum(targets[i, k], gaussian)
     
     return targets
@@ -190,30 +188,38 @@ class KeypointRCNN(nn.Module):
         self.backbone = nn.Sequential(*list(resnet.children())[:-2])
         self.out_channels = 512
         self.stride = 32
-        
+        # very long 
         self.kp_head = nn.Sequential(
+            nn.ConvTranspose2d(512, 512, 4, stride=2, padding=1),
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 512, 3, padding=1),
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True),
             nn.ConvTranspose2d(512, 256, 4, stride=2, padding=1),
-            nn.ReLU(),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
             nn.Conv2d(256, 256, 3, padding=1),
-            nn.ReLU(),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
             nn.Conv2d(256, 128, 3, padding=1),
-            nn.ReLU(),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
             nn.Conv2d(128, num_kp, 1)
         )
-        self.heatmap_size = 56
+        self.heatmap_size = 64
         
     def forward(self, images, proposals):
         feat = self.backbone(images)
         if proposals.shape[0] == 0:
             return torch.zeros((0, 17, self.heatmap_size, self.heatmap_size), device=images.device)
         
-        # ROI Align to extract features from proposals
-        pooled = roi_align(feat, proposals, output_size=(7, 7), spatial_scale=1.0/self.stride, sampling_ratio=2)
+        pooled = roi_align(feat, proposals, output_size=(14, 14), spatial_scale=1.0/self.stride, sampling_ratio=2)
         heatmaps = self.kp_head(pooled)
-        return F.interpolate(heatmaps, size=(self.heatmap_size, self.heatmap_size), mode='bilinear', align_corners=False)
+        return heatmaps
 
 # -------------------------
-# Training
+# training
 # -------------------------
 def train(model, dataloader, optimizer, device, batches_per_epoch):
     model.train()
@@ -226,7 +232,7 @@ def train(model, dataloader, optimizer, device, batches_per_epoch):
         
         imgs = imgs.to(device)
         
-        # Build proposals
+        # build proposals
         proposals = []
         gt_kps_list = []
         for b_idx, (boxes, kps) in enumerate(zip(boxes_list, kps_list)):
@@ -250,13 +256,20 @@ def train(model, dataloader, optimizer, device, batches_per_epoch):
         optimizer.zero_grad()
         preds = model(imgs, proposals)
         
-        # prevent errors if there's any outliers in dataset (possibly not required for this one)
+        # prevent errors so the code doesn't break if 1 unclean data is and instead skips
         if preds.shape != targets.shape:
-             logger.warning(f"Shape mismatch: preds {preds.shape} vs targets {targets.shape}. Skipping batch.")
              continue
         
         # loss 
-        loss = F.mse_loss(preds, targets)
+        # only calculate loss where there are actual keypoints (non-zero targets)
+        # this prevents the model from gaming the loss by predicting zeros everywhere
+        positive_mask = (targets > 0.01).float()  # Mask for actual keypoint locations
+        num_positive = positive_mask.sum()
+        
+        if num_positive > 0:
+            loss = (F.mse_loss(preds, targets, reduction='none') * positive_mask).sum() / num_positive
+        else:
+            continue
         
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -273,11 +286,8 @@ def train(model, dataloader, optimizer, device, batches_per_epoch):
 def draw_skeleton(img, kps, threshold=0.3):
     vis = img.copy()
     H, W = img.shape[:2]
-    
-    #diag Check threshold for drawing lines
-    # print(f"#diag: Draw Skeleton Threshold: {threshold}") 
-    
-    # Line Drawing Logic
+        
+    # line drawing logic
     for a, b in coco_skeleton:
         if a >= len(kps) or b >= len(kps):
             continue
@@ -285,100 +295,127 @@ def draw_skeleton(img, kps, threshold=0.3):
         xb, yb, sb = kps[b]
         
         if sa >= threshold and sb >= threshold:
+            #clip the lines so they aren't too long 
             pt1 = (int(np.clip(xa, 0, W-1)), int(np.clip(ya, 0, H-1)))
             pt2 = (int(np.clip(xb, 0, W-1)), int(np.clip(yb, 0, H-1)))
             cv2.line(vis, pt1, pt2, (0, 255, 0), 2, cv2.LINE_AA)
-        #diag: Check line skip reason
-        # else:
-        #     print(f"#diag: Skipped line ({a}-{b}). Scores: {sa:.4f}, {sb:.4f}")
 
-    # Dot Drawing Logic
+    # dot drawing logic
     for i, (x, y, s) in enumerate(kps):
         if s >= threshold:
-            #diag: Successfully passed threshold
-            # print(f"#diag: Keypoint {i} passed threshold (Score: {s:.4f}, Coords: ({x:.1f}, {y:.1f}))")
-            pt = (int(np.clip(x, 0, W-1)), int(np.clip(y, 0, H-1)))
-            cv2.circle(vis, pt, 4, (0, 255, 0), -1)
-            cv2.circle(vis, pt, 5, (255, 255, 255), 1)
-        #diag: Check dot skip reason
-        # else:
-        #     print(f"#diag: Keypoint {i} skipped (Score: {s:.4f})")
+            #diag
+            print(f'successfuly passed threshold: kp {i}, x={x:.1f}, y={y:.1f}, s={s:.3f}')
+            if np.isfinite(x) and np.isfinite(y):
+                pt = (int(np.clip(x, 0, W-1)), int(np.clip(y, 0, H-1)))
+                cv2.circle(vis, pt, 4, (0, 255, 0), -1)
+                cv2.circle(vis, pt, 5, (255, 255, 255), 1)
+            else:
+                # ignore bugs so it doesn't crash
+                print(f'  -> Skipped: non-finite coordinates')
     
     return vis
 
-#gemini's doing something here which i no longer understand. 
-def predict_frame(model, frame_rgb, input_size=512, device='cpu', threshold=0.3):
-    H, W = frame_rgb.shape[:2]
+#gemini wrote this next bit but now i understand it
+def predict_frame(model, frame_bgr, input_size=512, device='cpu', threshold=0.3):
+    #just scaling to make ui look good 
+    H, W = frame_bgr.shape[:2]
     scale = input_size / max(H, W)
     new_h, new_w = int(H * scale), int(W * scale)
+    
+    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     img = cv2.resize(frame_rgb, (new_w, new_h))
     
-    # Pad the resized image to a square (input_size x input_size)
+    #padding? 
     padded_img = np.zeros((input_size, input_size, 3), dtype=np.float32)
     padded_img[:new_h, :new_w] = img
     
     img_t = torch.from_numpy(padded_img / 255.0).permute(2, 0, 1).unsqueeze(0).to(device)
     
-    # Treat the valid, resized portion of the frame as the single proposal
-    proposals = torch.tensor([[0, 0, 0, new_w - 1, new_h - 1]], dtype=torch.float32, device=device)
+    #send in the edited image
+    proposals = torch.tensor([[0, 0, 0, new_w, new_h]], dtype=torch.float32, device=device)
     
     with torch.no_grad():
         heatmaps = model(img_t, proposals).squeeze(0).cpu().numpy()
     
     kps = []
-    heatmap_res = heatmaps.shape[2] # 56
+    heatmap_res = heatmaps.shape[1]  # Actual output size, not model.heatmap_size 
     
-    # Keypoint decoding (Max value method)
-    for k in range(17):
+    print(f"Heatmap shape: {heatmaps.shape}, max values: {heatmaps.max(axis=(1,2))}")
+    
+    for k in range(16+1):
         hm = heatmaps[k]
-        idx = hm.argmax()
-        y_idx, x_idx = idx // heatmap_res, idx % heatmap_res
+        hm_smooth = cv2.GaussianBlur(hm, (3, 3), 0)
         
-        score = hm[y_idx, x_idx]
+        flat_idx = hm_smooth.argmax()
+        y_idx, x_idx = divmod(flat_idx, heatmap_res)
         
-        # Rescale from normalized proposal (0 to 1) to PIXEL coordinates of the *resized* image (new_w x new_h)
-        x_img = (x_idx / (heatmap_res - 1)) * (new_w - 1)
-        y_img = (y_idx / (heatmap_res - 1)) * (new_h - 1)
+        score = float(hm_smooth[y_idx, x_idx])
         
-        # Rescale back to *original* image coordinates (H x W)
+        if score > 0.01:
+            y_window = slice(max(0, y_idx-2), min(heatmap_res, y_idx+3))
+            x_window = slice(max(0, x_idx-2), min(heatmap_res, x_idx+3))
+            local_region = hm_smooth[y_window, x_window]
+            
+            if local_region.size > 0:
+                y_coords, x_coords = np.mgrid[y_window, x_window]
+                total_mass = local_region.sum()
+                if total_mass > 0:
+                    y_idx = float((y_coords * local_region).sum() / total_mass)
+                    x_idx = float((x_coords * local_region).sum() / total_mass)
+        
+       # reverse our keypoint encoder
+        x_img = (x_idx / (heatmap_res - 1)) * new_w
+        y_img = (y_idx / (heatmap_res - 1)) * new_h
+        
         x_orig = x_img / scale
         y_orig = y_img / scale
         kps.append((x_orig, y_orig, score))
-
-        #diag: Print raw prediction result
-        # print(f"#diag: KP {k}: Max Score: {score:.4f}, Heatmap Index: ({x_idx}, {y_idx}), Orig Coords: ({x_orig:.1f}, {y_orig:.1f})")
     
-    vis = draw_skeleton(frame_rgb, kps, threshold)
-    return cv2.cvtColor(vis, cv2.COLOR_BGR2RGB), kps # NOTE: Changed return from BGR to RGB here
+    print(f"Keypoint scores: {[f'{s:.3f}' for x,y,s in kps]}")
+    print(f"Threshold: {threshold}, Passing: {sum(1 for x,y,s in kps if s >= threshold)}")
 
-#finally something normal. webcam
+    vis = draw_skeleton(frame_bgr, kps, threshold)
+    return vis, kps
+
+# basic webcam
 def run_webcam_demo(model, input_size=512, device='cpu'):
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
-        print("webcam does not work.")
+        print("Webcam does not work.")
         return
     
-    print("Press 'q' to quit.")
+    threshold = 0.05
+    print("Press 'q' to quit, 'o' to decrease threshold (-0.01), 'p' to increase threshold (+0.01)")
+    print(f"Current threshold: {threshold:.2f}")
+    
     while True:
         ret, frame = cap.read()
         if not ret:
             break
         
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        # Using a very low threshold to capture all predicted points for diagnosis
-        vis, _ = predict_frame(model, frame_rgb, input_size, device, threshold=0.03) 
+        vis, _ = predict_frame(model, frame, input_size, device, threshold=threshold) 
         
-        # We need to ensure the image is BGR for OpenCV display
-        cv2.imshow("Keypoint Demo", cv2.cvtColor(vis, cv2.COLOR_RGB2BGR)) 
+        # display threshold (looks nice)
+        cv2.putText(vis, f"Threshold: {threshold:.2f}", (10, 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
         
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        cv2.imshow("Keypoint Demo", vis) 
+        
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
             break
+        elif key == ord('o'):
+            threshold = max(0.0, threshold - 0.01)
+            print(f"Threshold decreased to: {threshold:.2f}")
+        elif key == ord('p'):
+            threshold = min(1.0, threshold + 0.01)
+            print(f"Threshold increased to: {threshold:.2f}")
     
     cap.release()
     cv2.destroyAllWindows()
 
 # -------------------------
-# main
+# main loop 
 # -------------------------
 if __name__ == "__main__":
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
